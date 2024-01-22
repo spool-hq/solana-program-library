@@ -75,6 +75,7 @@ impl SolendState {
                 *pubkey,
                 reserve.liquidity.pyth_oracle_pubkey,
                 reserve.liquidity.switchboard_oracle_pubkey,
+                reserve.config.extra_oracle_pubkey,
             )
         }));
 
@@ -128,6 +129,11 @@ impl SolendState {
             self.obligation_pubkey,
             withdraw_reserve.lending_market,
             self.obligation.owner,
+            self.obligation
+                .deposits
+                .iter()
+                .map(|d| d.deposit_reserve)
+                .collect(),
         ));
 
         instructions

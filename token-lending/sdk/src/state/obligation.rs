@@ -40,6 +40,8 @@ pub struct Obligation {
     /// Risk-adjusted market value of borrows.
     /// ie sum(b.borrowed_amount * b.current_spot_price * b.borrow_weight for b in borrows)
     pub borrowed_value: Decimal,
+    /// True borrow value. Ie, not risk adjusted like "borrowed_value"
+    pub unweighted_borrowed_value: Decimal,
     /// Risk-adjusted upper bound market value of borrows.
     /// ie sum(b.borrowed_amount * max(b.current_spot_price, b.smoothed_price) * b.borrow_weight for b in borrows)
     pub borrowed_value_upper_bound: Decimal,
@@ -59,6 +61,8 @@ pub struct Obligation {
     pub super_unhealthy_borrow_value: Decimal,
     /// True if the obligation is currently borrowing an isolated tier asset
     pub borrowing_isolated_asset: bool,
+    /// Obligation can be marked as closeable
+    pub closeable: bool,
 }
 
 impl Obligation {
@@ -133,7 +137,7 @@ impl Obligation {
 
         // convert max_withdraw_value to max withdraw liquidity amount
 
-        // why is min used and not max? seems scary
+        // why is lower bound used and not upper bound? seems scary
         //
         // the tldr is that allowed borrow value is calculated with the minimum
         // of the spot price and the smoothed price, so we have to use the min here to be
@@ -146,10 +150,7 @@ impl Obligation {
         // as using min.
         //
         // therefore, we use min for the better UX.
-        let price = min(
-            withdraw_reserve.liquidity.market_price,
-            withdraw_reserve.liquidity.smoothed_market_price,
-        );
+        let price = withdraw_reserve.price_lower_bound();
 
         let decimals = 10u64
             .checked_pow(withdraw_reserve.liquidity.mint_decimals as u32)
@@ -317,6 +318,8 @@ pub struct ObligationCollateral {
     pub deposited_amount: u64,
     /// Collateral market value in quote currency
     pub market_value: Decimal,
+    /// How much borrow is attributed to this collateral (USD)
+    pub attributed_borrow_value: Decimal,
 }
 
 impl ObligationCollateral {
@@ -326,6 +329,7 @@ impl ObligationCollateral {
             deposit_reserve,
             deposited_amount: 0,
             market_value: Decimal::zero(),
+            attributed_borrow_value: Decimal::zero(),
         }
     }
 
@@ -431,6 +435,8 @@ impl Pack for Obligation {
             borrowed_value_upper_bound,
             borrowing_isolated_asset,
             super_unhealthy_borrow_value,
+            unweighted_borrowed_value,
+            closeable,
             _padding,
             deposits_len,
             borrows_len,
@@ -449,7 +455,9 @@ impl Pack for Obligation {
             16,
             1,
             16,
-            31,
+            16,
+            1,
+            14,
             1,
             1,
             OBLIGATION_COLLATERAL_LEN + (OBLIGATION_LIQUIDITY_LEN * (MAX_OBLIGATION_RESERVES - 1))
@@ -471,6 +479,8 @@ impl Pack for Obligation {
             self.super_unhealthy_borrow_value,
             super_unhealthy_borrow_value,
         );
+        pack_decimal(self.unweighted_borrowed_value, unweighted_borrowed_value);
+        pack_bool(self.closeable, closeable);
 
         *deposits_len = u8::try_from(self.deposits.len()).unwrap().to_le_bytes();
         *borrows_len = u8::try_from(self.borrows.len()).unwrap().to_le_bytes();
@@ -481,11 +491,17 @@ impl Pack for Obligation {
         for collateral in &self.deposits {
             let deposits_flat = array_mut_ref![data_flat, offset, OBLIGATION_COLLATERAL_LEN];
             #[allow(clippy::ptr_offset_with_cast)]
-            let (deposit_reserve, deposited_amount, market_value, _padding_deposit) =
-                mut_array_refs![deposits_flat, PUBKEY_BYTES, 8, 16, 32];
+            let (
+                deposit_reserve,
+                deposited_amount,
+                market_value,
+                attributed_borrow_value,
+                _padding_deposit,
+            ) = mut_array_refs![deposits_flat, PUBKEY_BYTES, 8, 16, 16, 16];
             deposit_reserve.copy_from_slice(collateral.deposit_reserve.as_ref());
             *deposited_amount = collateral.deposited_amount.to_le_bytes();
             pack_decimal(collateral.market_value, market_value);
+            pack_decimal(collateral.attributed_borrow_value, attributed_borrow_value);
             offset += OBLIGATION_COLLATERAL_LEN;
         }
 
@@ -528,6 +544,8 @@ impl Pack for Obligation {
             borrowed_value_upper_bound,
             borrowing_isolated_asset,
             super_unhealthy_borrow_value,
+            unweighted_borrowed_value,
+            closeable,
             _padding,
             deposits_len,
             borrows_len,
@@ -546,7 +564,9 @@ impl Pack for Obligation {
             16,
             1,
             16,
-            31,
+            16,
+            1,
+            14,
             1,
             1,
             OBLIGATION_COLLATERAL_LEN + (OBLIGATION_LIQUIDITY_LEN * (MAX_OBLIGATION_RESERVES - 1))
@@ -567,12 +587,18 @@ impl Pack for Obligation {
         for _ in 0..deposits_len {
             let deposits_flat = array_ref![data_flat, offset, OBLIGATION_COLLATERAL_LEN];
             #[allow(clippy::ptr_offset_with_cast)]
-            let (deposit_reserve, deposited_amount, market_value, _padding_deposit) =
-                array_refs![deposits_flat, PUBKEY_BYTES, 8, 16, 32];
+            let (
+                deposit_reserve,
+                deposited_amount,
+                market_value,
+                attributed_borrow_value,
+                _padding_deposit,
+            ) = array_refs![deposits_flat, PUBKEY_BYTES, 8, 16, 16, 16];
             deposits.push(ObligationCollateral {
                 deposit_reserve: Pubkey::new(deposit_reserve),
                 deposited_amount: u64::from_le_bytes(*deposited_amount),
                 market_value: unpack_decimal(market_value),
+                attributed_borrow_value: unpack_decimal(attributed_borrow_value),
             });
             offset += OBLIGATION_COLLATERAL_LEN;
         }
@@ -607,11 +633,13 @@ impl Pack for Obligation {
             borrows,
             deposited_value: unpack_decimal(deposited_value),
             borrowed_value: unpack_decimal(borrowed_value),
+            unweighted_borrowed_value: unpack_decimal(unweighted_borrowed_value),
             borrowed_value_upper_bound: unpack_decimal(borrowed_value_upper_bound),
             allowed_borrow_value: unpack_decimal(allowed_borrow_value),
             unhealthy_borrow_value: unpack_decimal(unhealthy_borrow_value),
             super_unhealthy_borrow_value: unpack_decimal(super_unhealthy_borrow_value),
             borrowing_isolated_asset: unpack_bool(borrowing_isolated_asset)?,
+            closeable: unpack_bool(closeable)?,
         })
     }
 }
@@ -646,6 +674,7 @@ mod test {
                     deposit_reserve: Pubkey::new_unique(),
                     deposited_amount: rng.gen(),
                     market_value: rand_decimal(),
+                    attributed_borrow_value: rand_decimal(),
                 }],
                 borrows: vec![ObligationLiquidity {
                     borrow_reserve: Pubkey::new_unique(),
@@ -655,11 +684,13 @@ mod test {
                 }],
                 deposited_value: rand_decimal(),
                 borrowed_value: rand_decimal(),
+                unweighted_borrowed_value: rand_decimal(),
                 borrowed_value_upper_bound: rand_decimal(),
                 allowed_borrow_value: rand_decimal(),
                 unhealthy_borrow_value: rand_decimal(),
                 super_unhealthy_borrow_value: rand_decimal(),
                 borrowing_isolated_asset: rng.gen(),
+                closeable: rng.gen(),
             };
 
             let mut packed = [0u8; OBLIGATION_LEN];
@@ -930,6 +961,54 @@ mod test {
                         borrowed_amount_wads: Decimal::zero(),
                         market_price: Decimal::from(10u64),
                         smoothed_market_price: Decimal::from(5u64),
+                        mint_decimals: 9,
+                        ..ReserveLiquidity::default()
+                    },
+                    collateral: ReserveCollateral {
+                        mint_total_supply: 50 * LAMPORTS_PER_SOL,
+                        ..ReserveCollateral::default()
+                    },
+                    ..Reserve::default()
+                },
+
+                // deposited 20 cSOL
+                // => allowed borrow value: 20 cSOL * 2(SOL/cSOL) * 0.5(ltv) * $5 = $100
+                // => borrowed value upper bound: $50
+                // => max withdraw value: ($100 - $50) / 0.5 = $100
+                // => max withdraw liquidity amount: $100 / $5 = 20 SOL
+                // => max withdraw collateral amount: 20 SOL / 2(SOL/cSOL) = 10 cSOL
+                // after withdrawing, the new allowed borrow value is:
+                // 10 cSOL * 2(SOL/cSOL) * 0.5(ltv) * $5 = $50, which is exactly what we want.
+                expected_max_withdraw_amount: 10 * LAMPORTS_PER_SOL, // 10 cSOL
+            }),
+            // regular case
+            Just(MaxWithdrawAmountTestCase {
+                obligation: Obligation {
+                    deposits: vec![ObligationCollateral {
+                        deposited_amount: 20 * LAMPORTS_PER_SOL,
+                        ..ObligationCollateral::default()
+                    }],
+                    borrows: vec![ObligationLiquidity {
+                        borrowed_amount_wads: Decimal::from(10u64),
+                        ..ObligationLiquidity::default()
+                    }],
+
+                    allowed_borrow_value: Decimal::from(100u64),
+                    borrowed_value_upper_bound: Decimal::from(50u64),
+                    ..Obligation::default()
+                },
+
+                reserve: Reserve {
+                    config: ReserveConfig {
+                        loan_to_value_ratio: 50,
+                        ..ReserveConfig::default()
+                    },
+                    liquidity: ReserveLiquidity {
+                        available_amount: 100 * LAMPORTS_PER_SOL,
+                        borrowed_amount_wads: Decimal::zero(),
+                        market_price: Decimal::from(10u64),
+                        smoothed_market_price: Decimal::from(10u64),
+                        extra_market_price: Some(Decimal::from(5u64)),
                         mint_decimals: 9,
                         ..ReserveLiquidity::default()
                     },

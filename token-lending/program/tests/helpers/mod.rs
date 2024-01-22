@@ -4,6 +4,7 @@ pub mod flash_loan_proxy;
 pub mod flash_loan_receiver;
 pub mod genesis;
 pub mod mock_pyth;
+pub mod mock_switchboard;
 pub mod solend_program_test;
 
 use bytemuck::{cast_slice_mut, from_bytes_mut, try_cast_slice_mut, Pod, PodCastError};
@@ -26,6 +27,38 @@ pub const QUOTE_CURRENCY: [u8; 32] =
 
 pub const LAMPORTS_TO_SOL: u64 = 1_000_000_000;
 pub const FRACTIONAL_TO_USDC: u64 = 1_000_000;
+
+pub fn reserve_config_no_fees() -> ReserveConfig {
+    ReserveConfig {
+        optimal_utilization_rate: 80,
+        max_utilization_rate: 80,
+        loan_to_value_ratio: 50,
+        liquidation_bonus: 0,
+        max_liquidation_bonus: 0,
+        liquidation_threshold: 55,
+        max_liquidation_threshold: 65,
+        min_borrow_rate: 0,
+        optimal_borrow_rate: 0,
+        max_borrow_rate: 0,
+        super_max_borrow_rate: 0,
+        fees: ReserveFees {
+            borrow_fee_wad: 0,
+            flash_loan_fee_wad: 0,
+            host_fee_percentage: 0,
+        },
+        deposit_limit: u64::MAX,
+        borrow_limit: u64::MAX,
+        fee_receiver: Keypair::new().pubkey(),
+        protocol_liquidation_fee: 0,
+        protocol_take_rate: 0,
+        added_borrow_weight_bps: 0,
+        reserve_type: ReserveType::Regular,
+        scaled_price_offset_bps: 0,
+        extra_oracle_pubkey: None,
+        attributed_borrow_limit_open: u64::MAX,
+        attributed_borrow_limit_close: u64::MAX,
+    }
+}
 
 pub fn test_reserve_config() -> ReserveConfig {
     ReserveConfig {
@@ -52,6 +85,10 @@ pub fn test_reserve_config() -> ReserveConfig {
         protocol_take_rate: 0,
         added_borrow_weight_bps: 0,
         reserve_type: ReserveType::Regular,
+        scaled_price_offset_bps: 0,
+        extra_oracle_pubkey: None,
+        attributed_borrow_limit_open: u64::MAX,
+        attributed_borrow_limit_close: u64::MAX,
     }
 }
 
@@ -66,6 +103,11 @@ pub mod usdt_mint {
 pub mod wsol_mint {
     // fake mint, not the real wsol bc i can't mint wsol programmatically
     solana_program::declare_id!("So1m5eppzgokXLBt9Cg8KCMPWhHfTzVaGh26Y415MRG");
+}
+
+pub mod msol_mint {
+    // fake mint, not the real wsol bc i can't mint wsol programmatically
+    solana_program::declare_id!("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So");
 }
 
 pub mod bonk_mint {
