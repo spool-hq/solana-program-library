@@ -6,6 +6,7 @@ use crate::{
     state::{RateLimiterConfig, ReserveConfig, ReserveFees},
 };
 use bytemuck::bytes_of;
+use std::convert::TryFrom;
 
 use num_traits::FromPrimitive;
 use solana_program::system_program;
@@ -834,7 +835,7 @@ impl LendingInstruction {
             return Err(LendingError::InstructionUnpackError.into());
         }
         let (key, rest) = input.split_at(PUBKEY_BYTES);
-        let pk = Pubkey::new(key);
+        let pk = Pubkey::try_from(key).map_err(|_| LendingError::InstructionUnpackError)?;
         Ok((pk, rest))
     }
 

@@ -8,16 +8,15 @@ use solana_program::{
     pubkey::Pubkey,
     sysvar::Sysvar,
 };
-use std::cell::RefMut;
 
-use switchboard_v2::{AggregatorAccountData, SwitchboardDecimal};
+use switchboard_on_demand::PullFeedAccountData;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use spl_token::solana_program::{account_info::next_account_info, program_error::ProgramError};
 use thiserror::Error;
 
 #[derive(BorshSerialize, BorshDeserialize)]
-pub enum MockSwitchboardInstruction {
+pub enum MockSwitchboardPullInstruction {
     /// Accounts:
     /// 0: AggregatorAccount
     InitSwitchboard,
@@ -42,38 +41,31 @@ impl Processor {
         accounts: &[AccountInfo],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        let instruction = MockSwitchboardInstruction::try_from_slice(instruction_data)?;
+        let instruction = MockSwitchboardPullInstruction::try_from_slice(instruction_data)?;
         let account_info_iter = &mut accounts.iter().peekable();
 
         match instruction {
-            MockSwitchboardInstruction::InitSwitchboard => {
-                msg!("Mock Switchboard: Init Switchboard");
+            MockSwitchboardPullInstruction::InitSwitchboard => {
+                msg!("Mock Switchboard Pull: Init Switchboard");
                 let switchboard_feed = next_account_info(account_info_iter)?;
                 let mut data = switchboard_feed.try_borrow_mut_data()?;
 
-                let discriminator = [217, 230, 65, 101, 201, 162, 27, 125];
-                data[0..8].copy_from_slice(&discriminator);
+                data[0..8].copy_from_slice(&PullFeedAccountData::discriminator());
+
                 Ok(())
             }
-            MockSwitchboardInstruction::SetSwitchboardPrice { price, expo } => {
-                msg!("Mock Switchboard: Set Switchboard price");
+            MockSwitchboardPullInstruction::SetSwitchboardPrice { price, expo } => {
+                msg!("Mock Switchboard Pull: Set Switchboard price");
                 let switchboard_feed = next_account_info(account_info_iter)?;
-                let data = switchboard_feed.try_borrow_mut_data()?;
 
-                let mut aggregator_account: RefMut<AggregatorAccountData> =
-                    RefMut::map(data, |data| {
-                        bytemuck::from_bytes_mut(
-                            &mut data[8..std::mem::size_of::<AggregatorAccountData>() + 8],
-                        )
-                    });
+                let mut data = switchboard_feed.try_borrow_mut_data()?;
 
-                aggregator_account.min_oracle_results = 1;
-                aggregator_account.latest_confirmed_round.num_success = 1;
-                aggregator_account.latest_confirmed_round.result = SwitchboardDecimal {
-                    mantissa: price as i128,
-                    scale: expo as u32,
-                };
-                aggregator_account.latest_confirmed_round.round_open_slot = Clock::get()?.slot;
+                let scaled = (price as i128) * 10i128.pow((18 + expo) as u32);
+
+                let result_offset = 8 + 2256;
+                data[result_offset..(result_offset + 16)].copy_from_slice(&scaled.to_le_bytes());
+                data[(result_offset + 104)..(result_offset + 112)]
+                    .copy_from_slice(&Clock::get()?.slot.to_le_bytes());
 
                 Ok(())
             }
@@ -82,7 +74,7 @@ impl Processor {
 }
 
 #[derive(Error, Debug, Copy, Clone)]
-pub enum MockSwitchboardError {
+pub enum MockSwitchboardPullError {
     /// Invalid instruction
     #[error("Invalid Instruction")]
     InvalidInstruction,
@@ -92,8 +84,8 @@ pub enum MockSwitchboardError {
     FailedToDeserialize,
 }
 
-impl From<MockSwitchboardError> for ProgramError {
-    fn from(e: MockSwitchboardError) -> Self {
+impl From<MockSwitchboardPullError> for ProgramError {
+    fn from(e: MockSwitchboardPullError) -> Self {
         ProgramError::Custom(e as u32)
     }
 }
@@ -104,7 +96,7 @@ pub fn set_switchboard_price(
     price: i64,
     expo: i32,
 ) -> Instruction {
-    let data = MockSwitchboardInstruction::SetSwitchboardPrice { price, expo }
+    let data = MockSwitchboardPullInstruction::SetSwitchboardPrice { price, expo }
         .try_to_vec()
         .unwrap();
     Instruction {
@@ -115,7 +107,7 @@ pub fn set_switchboard_price(
 }
 
 pub fn init_switchboard(program_id: Pubkey, switchboard_feed: Pubkey) -> Instruction {
-    let data = MockSwitchboardInstruction::InitSwitchboard
+    let data = MockSwitchboardPullInstruction::InitSwitchboard
         .try_to_vec()
         .unwrap();
     Instruction {

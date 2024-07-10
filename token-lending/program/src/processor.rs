@@ -6,7 +6,6 @@ use crate::{
     error::LendingError,
     instruction::LendingInstruction,
     math::{Decimal, Rate, TryAdd, TryDiv, TryMul, TrySub},
-    oracles::get_pyth_price,
     state::{
         validate_reserve_config, CalculateBorrowResult, CalculateLiquidationResult,
         CalculateRepayResult, InitLendingMarketParams, InitObligationParams, InitReserveParams,
@@ -15,8 +14,12 @@ use crate::{
     },
 };
 use bytemuck::bytes_of;
-use pyth_sdk_solana::{self, state::ProductAccount};
-
+use oracles::get_single_price;
+use oracles::get_single_price_unchecked;
+use oracles::pyth::validate_pyth_keys;
+use oracles::switchboard::validate_sb_on_demand_keys;
+use oracles::switchboard::validate_switchboard_keys;
+use oracles::{get_oracle_type, pyth::validate_pyth_price_account_info, OracleType};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -30,21 +33,13 @@ use solana_program::{
     sysvar::instructions::{load_current_index_checked, load_instruction_at_checked},
     sysvar::{clock::Clock, rent::Rent, Sysvar},
 };
-
 use solend_sdk::{
     math::SaturatingSub,
-    oracles::{
-        get_oracle_type, get_pyth_price_unchecked, validate_pyth_price_account_info, OracleType,
-    },
     state::{LendingMarketMetadata, RateLimiter, RateLimiterConfig, ReserveType},
 };
-use solend_sdk::{switchboard_v2_devnet, switchboard_v2_mainnet};
+
 use spl_token::state::Mint;
 use std::{cmp::min, result::Result};
-use switchboard_program::{
-    get_aggregator, get_aggregator_result, AggregatorState, RoundResult, SwitchboardAccountType,
-};
-use switchboard_v2::AggregatorAccountData;
 
 /// solend market owner
 pub mod solend_market_owner {
@@ -338,7 +333,7 @@ fn process_init_reserve(
         return Err(LendingError::InvalidAccountInput.into());
     }
 
-    let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
+    let lending_market = Box::new(LendingMarket::unpack(&lending_market_info.data.borrow())?);
     if lending_market_info.owner != program_id {
         msg!(
             "Lending market provided is not owned by the lending program  {} != {}",
@@ -366,12 +361,12 @@ fn process_init_reserve(
         msg!("Both price oracles are null. At least one must be non-null");
         return Err(LendingError::InvalidOracleConfig.into());
     }
-    validate_pyth_keys(&lending_market, pyth_product_info, pyth_price_info)?;
-    validate_switchboard_keys(&lending_market, switchboard_feed_info)?;
+    validate_pyth_keys(pyth_price_info)?;
+    validate_switchboard_keys(switchboard_feed_info)?;
 
     if let Some(extra_oracle_pubkey) = config.extra_oracle_pubkey {
         let extra_oracle_info = next_account_info(account_info_iter)?;
-        validate_extra_oracle(&lending_market, extra_oracle_pubkey, extra_oracle_info)?;
+        validate_extra_oracle(extra_oracle_pubkey, extra_oracle_info)?;
     }
 
     let (market_price, smoothed_market_price) =
@@ -481,7 +476,6 @@ fn process_init_reserve(
 }
 
 fn validate_extra_oracle(
-    lending_market: &LendingMarket,
     extra_oracle_pubkey: Pubkey,
     extra_oracle_info: &AccountInfo<'_>,
 ) -> Result<(), ProgramError> {
@@ -497,10 +491,16 @@ fn validate_extra_oracle(
 
     match get_oracle_type(extra_oracle_info)? {
         OracleType::Pyth => {
-            validate_pyth_price_account_info(lending_market, extra_oracle_info)?;
+            validate_pyth_price_account_info(extra_oracle_info)?;
+        }
+        OracleType::PythPull => {
+            validate_pyth_price_account_info(extra_oracle_info)?;
         }
         OracleType::Switchboard => {
-            validate_switchboard_keys(lending_market, extra_oracle_info)?;
+            validate_switchboard_keys(extra_oracle_info)?;
+        }
+        OracleType::SbOnDemand => {
+            validate_sb_on_demand_keys(extra_oracle_info)?;
         }
     }
 
@@ -571,14 +571,10 @@ fn _refresh_reserve<'a>(
                     return Err(LendingError::InvalidAccountInput.into());
                 }
 
-                match get_oracle_type(extra_oracle_account_info)? {
-                    OracleType::Pyth => Some(get_pyth_price_unchecked(extra_oracle_account_info)?),
-                    OracleType::Switchboard => Some(get_switchboard_price_v2(
-                        extra_oracle_account_info,
-                        clock,
-                        false,
-                    )?),
-                }
+                Some(get_single_price_unchecked(
+                    extra_oracle_account_info,
+                    clock,
+                )?)
             }
             None => {
                 msg!("Reserve extra oracle account info missing");
@@ -600,9 +596,9 @@ fn _refresh_reserve<'a>(
 
 /// Lite version of refresh_reserve that should be used when the oracle price doesn't need to be updated
 /// BE CAREFUL WHEN USING THIS
-fn _refresh_reserve_interest<'a>(
+fn _refresh_reserve_interest(
     program_id: &Pubkey,
-    reserve_info: &AccountInfo<'a>,
+    reserve_info: &AccountInfo<'_>,
     clock: &Clock,
 ) -> ProgramResult {
     let mut reserve = Box::new(Reserve::unpack(&reserve_info.data.borrow())?);
@@ -2022,7 +2018,7 @@ fn _liquidate_obligation<'a>(
     clock: &Clock,
     token_program_id: &AccountInfo<'a>,
 ) -> Result<(u64, Bonus), ProgramError> {
-    let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
+    let lending_market = Box::new(LendingMarket::unpack(&lending_market_info.data.borrow())?);
     if lending_market_info.owner != program_id {
         msg!("Lending market provided is not owned by the lending program");
         return Err(LendingError::InvalidAccountOwner.into());
@@ -2377,7 +2373,7 @@ fn process_update_reserve_config(
     let lending_market_info = next_account_info(account_info_iter)?;
     let lending_market_authority_info = next_account_info(account_info_iter)?;
     let signer_info = next_account_info(account_info_iter)?;
-    let pyth_product_info = next_account_info(account_info_iter)?;
+    let _pyth_product_info = next_account_info(account_info_iter)?;
     let pyth_price_info = next_account_info(account_info_iter)?;
     let switchboard_feed_info = next_account_info(account_info_iter)?;
 
@@ -2395,7 +2391,7 @@ fn process_update_reserve_config(
         return Err(LendingError::InvalidAccountInput.into());
     }
 
-    let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
+    let lending_market = Box::new(LendingMarket::unpack(&lending_market_info.data.borrow())?);
     if lending_market_info.owner != program_id {
         msg!(
             "Lending market provided is not owned by the lending program  {} != {}",
@@ -2451,12 +2447,12 @@ fn process_update_reserve_config(
         }
 
         if *pyth_price_info.key != reserve.liquidity.pyth_oracle_pubkey {
-            validate_pyth_keys(&lending_market, pyth_product_info, pyth_price_info)?;
+            validate_pyth_keys(pyth_price_info)?;
             reserve.liquidity.pyth_oracle_pubkey = *pyth_price_info.key;
         }
 
         if *switchboard_feed_info.key != reserve.liquidity.switchboard_oracle_pubkey {
-            validate_switchboard_keys(&lending_market, switchboard_feed_info)?;
+            validate_switchboard_keys(switchboard_feed_info)?;
             reserve.liquidity.switchboard_oracle_pubkey = *switchboard_feed_info.key;
         }
         if reserve.liquidity.switchboard_oracle_pubkey == solend_program::NULL_PUBKEY
@@ -2468,7 +2464,7 @@ fn process_update_reserve_config(
 
         if let Some(extra_oracle_pubkey) = config.extra_oracle_pubkey {
             let extra_oracle_info = next_account_info(account_info_iter)?;
-            validate_extra_oracle(&lending_market, extra_oracle_pubkey, extra_oracle_info)?;
+            validate_extra_oracle(extra_oracle_pubkey, extra_oracle_info)?;
         }
 
         reserve.config = config;
@@ -3207,125 +3203,28 @@ fn unpack_mint(data: &[u8]) -> Result<Mint, LendingError> {
     Mint::unpack(data).map_err(|_| LendingError::InvalidTokenMint)
 }
 
-fn get_pyth_product_quote_currency(
-    pyth_product: &ProductAccount,
-) -> Result<[u8; 32], ProgramError> {
-    pyth_product
-        .iter()
-        .find_map(|(key, val)| {
-            if key == "quote_currency" {
-                let mut value = [0u8; 32];
-                value[0..val.len()].copy_from_slice(val.as_bytes());
-                Some(value)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            msg!("Pyth product quote currency not found");
-            LendingError::InvalidOracleConfig.into()
-        })
-}
-
 /// get_price tries to load the oracle price from pyth, and if it fails, uses switchboard.
 /// The first element in the returned tuple is the market price, and the second is the optional
 /// smoothed price (eg ema, twap).
 fn get_price(
-    switchboard_feed_info: Option<&AccountInfo>,
-    pyth_price_account_info: &AccountInfo,
+    secondary_price_account_info: Option<&AccountInfo>,
+    main_price_account_info: &AccountInfo,
     clock: &Clock,
 ) -> Result<(Decimal, Option<Decimal>), ProgramError> {
-    if let Ok(prices) = get_pyth_price(pyth_price_account_info, clock) {
-        return Ok((prices.0, Some(prices.1)));
+    if let Ok(prices) = get_single_price(main_price_account_info, clock) {
+        return Ok((prices.0, prices.1));
     }
 
-    // if switchboard was not passed in don't try to grab the price
-    if let Some(switchboard_feed_info_unwrapped) = switchboard_feed_info {
-        // TODO: add support for switchboard smoothed prices. Probably need to add a new
-        // switchboard account per reserve.
-        return match get_switchboard_price(switchboard_feed_info_unwrapped, clock) {
-            Ok(price) => Ok((price, None)),
-            Err(e) => Err(e),
-        };
+    // if secondary was not passed in don't try to grab the price
+    if let Some(secondary_price_account_info_unwrapped) = secondary_price_account_info {
+        // TODO: add support for secondary smoothed prices. Probably need to add a new
+        // secondary account per reserve.
+        if let Ok(prices) = get_single_price(secondary_price_account_info_unwrapped, clock) {
+            return Ok((prices.0, prices.1));
+        }
     }
 
     Err(LendingError::InvalidOracleConfig.into())
-}
-
-fn get_switchboard_price(
-    switchboard_feed_info: &AccountInfo,
-    clock: &Clock,
-) -> Result<Decimal, ProgramError> {
-    const STALE_AFTER_SLOTS_ELAPSED: u64 = 240;
-
-    if *switchboard_feed_info.key == solend_program::NULL_PUBKEY {
-        return Err(LendingError::NullOracleConfig.into());
-    }
-    if switchboard_feed_info.owner == &switchboard_v2_mainnet::id()
-        || switchboard_feed_info.owner == &switchboard_v2_devnet::id()
-    {
-        return get_switchboard_price_v2(switchboard_feed_info, clock, true);
-    }
-
-    let account_buf = switchboard_feed_info.try_borrow_data()?;
-    // first byte type discriminator
-    if account_buf[0] != SwitchboardAccountType::TYPE_AGGREGATOR as u8 {
-        msg!("switchboard address not of type aggregator");
-        return Err(LendingError::InvalidAccountInput.into());
-    }
-
-    let aggregator: AggregatorState = get_aggregator(switchboard_feed_info)?;
-    // if aggregator.version != 1 {
-    //     msg!("switchboard version incorrect");
-    //     return Err(LendingError::InvalidAccountInput.into());
-    // }
-    let round_result: RoundResult = get_aggregator_result(&aggregator)?;
-
-    let slots_elapsed = clock
-        .slot
-        .checked_sub(round_result.round_open_slot.unwrap())
-        .ok_or(LendingError::MathOverflow)?;
-    if slots_elapsed >= STALE_AFTER_SLOTS_ELAPSED {
-        msg!("Switchboard oracle price is stale");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-
-    let price_float = round_result.result.unwrap_or(0.0);
-
-    // we just do this so we can parse coins with low usd value
-    // it might be better to just extract the mantissa and exponent from the float directly
-    let price_quotient = 10u64.pow(9);
-    let price = ((price_quotient as f64) * price_float) as u128;
-
-    Decimal::from(price).try_div(price_quotient)
-}
-
-fn get_switchboard_price_v2(
-    switchboard_feed_info: &AccountInfo,
-    clock: &Clock,
-    check_staleness: bool,
-) -> Result<Decimal, ProgramError> {
-    const STALE_AFTER_SLOTS_ELAPSED: u64 = 240;
-    let data = &switchboard_feed_info.try_borrow_data()?;
-    let feed = AggregatorAccountData::new_from_bytes(data)?;
-
-    let slots_elapsed = clock
-        .slot
-        .checked_sub(feed.latest_confirmed_round.round_open_slot)
-        .ok_or(LendingError::MathOverflow)?;
-    if check_staleness && slots_elapsed >= STALE_AFTER_SLOTS_ELAPSED {
-        msg!("Switchboard oracle price is stale");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-
-    let price_switchboard_desc = feed.get_result()?;
-    if price_switchboard_desc.mantissa < 0 {
-        msg!("Switchboard oracle price is negative which is not allowed");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-    let price = Decimal::from(price_switchboard_desc.mantissa as u128);
-    let exp = Decimal::from((10u128).checked_pow(price_switchboard_desc.scale).unwrap());
-    price.try_div(exp)
 }
 
 /// Issue a spl_token `InitializeAccount` instruction.
@@ -3459,63 +3358,6 @@ fn spl_token_burn(params: TokenBurnParams<'_, '_>) -> ProgramResult {
         authority_signer_seeds,
     );
     result.map_err(|_| LendingError::TokenBurnFailed.into())
-}
-
-/// validates pyth AccountInfos
-#[inline(always)]
-fn validate_pyth_keys(
-    lending_market: &LendingMarket,
-    pyth_product_info: &AccountInfo,
-    pyth_price_info: &AccountInfo,
-) -> ProgramResult {
-    if *pyth_price_info.key == solend_program::NULL_PUBKEY {
-        return Ok(());
-    }
-    if &lending_market.oracle_program_id != pyth_product_info.owner {
-        msg!("Pyth product account provided is not owned by the lending market oracle program");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-    if &lending_market.oracle_program_id != pyth_price_info.owner {
-        msg!("Pyth price account provided is not owned by the lending market oracle program");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-
-    let pyth_product_data = pyth_product_info.try_borrow_data()?;
-    let pyth_product = pyth_sdk_solana::state::load_product_account(&pyth_product_data)?;
-
-    if &pyth_product.px_acc != pyth_price_info.key {
-        msg!("Pyth product price account does not match the Pyth price provided");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-
-    let quote_currency = get_pyth_product_quote_currency(pyth_product)?;
-    if lending_market.quote_currency != quote_currency {
-        msg!("Lending market quote currency does not match the oracle quote currency");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-    Ok(())
-}
-
-/// validates switchboard AccountInfo
-fn validate_switchboard_keys(
-    lending_market: &LendingMarket,
-    switchboard_feed_info: &AccountInfo,
-) -> ProgramResult {
-    if *switchboard_feed_info.key == solend_program::NULL_PUBKEY {
-        return Ok(());
-    }
-    if switchboard_feed_info.owner != &lending_market.switchboard_oracle_program_id
-        && switchboard_feed_info.owner != &switchboard_v2_mainnet::id()
-        && switchboard_feed_info.owner != &switchboard_v2_devnet::id()
-    {
-        msg!("Switchboard account provided is not owned by the switchboard oracle program");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-
-    let data = &switchboard_feed_info.try_borrow_data()?;
-    AggregatorAccountData::new_from_bytes(data)?;
-
-    Ok(())
 }
 
 fn is_cpi_call(

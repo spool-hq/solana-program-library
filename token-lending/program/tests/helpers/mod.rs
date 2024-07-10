@@ -4,7 +4,9 @@ pub mod flash_loan_proxy;
 pub mod flash_loan_receiver;
 pub mod genesis;
 pub mod mock_pyth;
+pub mod mock_pyth_pull;
 pub mod mock_switchboard;
+pub mod mock_switchboard_pull;
 pub mod solend_program_test;
 
 use bytemuck::{cast_slice_mut, from_bytes_mut, try_cast_slice_mut, Pod, PodCastError};

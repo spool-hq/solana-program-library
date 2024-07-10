@@ -1,13 +1,21 @@
 use bytemuck::checked::from_bytes;
+use oracles::switchboard_on_demand_mainnet;
 
+use oracles::pyth_mainnet;
+use oracles::pyth_pull_mainnet;
+use oracles::switchboard_v2_mainnet;
+use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 use solend_sdk::instruction::*;
-use solend_sdk::pyth_mainnet;
 use solend_sdk::state::*;
-use solend_sdk::switchboard_v2_mainnet;
+use switchboard_on_demand::PullFeedAccountData;
 
 use super::{
     flash_loan_proxy::proxy_program,
     mock_switchboard::{init_switchboard, set_switchboard_price},
+    mock_switchboard_pull::{
+        init_switchboard as init_switchboard_pull,
+        set_switchboard_price as set_switchboard_pull_price,
+    },
 };
 use crate::helpers::*;
 use solana_program::native_token::LAMPORTS_PER_SOL;
@@ -47,6 +55,7 @@ use std::{
 };
 
 use super::mock_pyth::{init, set_price};
+use super::mock_pyth_pull::{init as init_pull, set_price as set_price_pull};
 
 pub struct SolendProgramTest {
     pub context: ProgramTestContext,
@@ -80,9 +89,19 @@ impl SolendProgramTest {
             processor!(mock_pyth::process_instruction),
         );
         test.add_program(
+            "mock_pyth_pull",
+            pyth_pull_mainnet::id(),
+            processor!(mock_pyth_pull::process_instruction),
+        );
+        test.add_program(
             "mock_switchboard",
             switchboard_v2_mainnet::id(),
             processor!(mock_switchboard::process_instruction),
+        );
+        test.add_program(
+            "mock_switchboard_pull",
+            switchboard_on_demand_mainnet::id(),
+            processor!(mock_switchboard_pull::process_instruction),
         );
 
         test.add_program(
@@ -130,9 +149,19 @@ impl SolendProgramTest {
             processor!(mock_pyth::process_instruction),
         );
         test.add_program(
+            "mock_pyth_pull",
+            pyth_pull_mainnet::id(),
+            processor!(mock_pyth_pull::process_instruction),
+        );
+        test.add_program(
             "mock_switchboard",
             switchboard_v2_mainnet::id(),
             processor!(mock_switchboard::process_instruction),
+        );
+        test.add_program(
+            "mock_switchboard_pull",
+            switchboard_on_demand_mainnet::id(),
+            processor!(mock_switchboard_pull::process_instruction),
         );
 
         test.add_program(
@@ -461,6 +490,46 @@ impl SolendProgramTest {
         .unwrap();
     }
 
+    pub async fn init_pyth_pull_feed(&mut self, mint: &Pubkey) -> Pubkey {
+        let pyth_price_pubkey = self
+            .create_account(PriceUpdateV2::LEN, &pyth_pull_mainnet::id(), None)
+            .await;
+
+        self.process_transaction(
+            &[init_pull(pyth_pull_mainnet::id(), pyth_price_pubkey)],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let oracle = self.mints.get_mut(mint).unwrap();
+        if let Some(ref mut oracle) = oracle {
+            oracle.pyth_price_pubkey = pyth_price_pubkey;
+        } else {
+            panic!("oracle not initialized");
+        }
+
+        pyth_price_pubkey
+    }
+
+    pub async fn set_pyth_pull_price(&mut self, mint: &Pubkey, price: &PriceArgs) {
+        let oracle = self.mints.get(mint).unwrap().unwrap();
+        self.process_transaction(
+            &[set_price_pull(
+                pyth_pull_mainnet::id(),
+                oracle.pyth_price_pubkey,
+                price.price,
+                price.conf,
+                price.expo,
+                price.ema_price,
+                price.ema_conf,
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
     pub async fn init_switchboard_feed(&mut self, mint: &Pubkey) -> Pubkey {
         let switchboard_feed_pubkey = self
             .create_account(
@@ -489,11 +558,54 @@ impl SolendProgramTest {
         }
     }
 
+    pub async fn init_switchboard_pull_feed(&mut self, mint: &Pubkey) -> Pubkey {
+        let switchboard_feed_pubkey = self
+            .create_account(
+                std::mem::size_of::<PullFeedAccountData>() + 8,
+                &switchboard_on_demand_mainnet::id(),
+                None,
+            )
+            .await;
+
+        self.process_transaction(
+            &[init_switchboard_pull(
+                switchboard_on_demand_mainnet::id(),
+                switchboard_feed_pubkey,
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let oracle = self.mints.get_mut(mint).unwrap();
+        if let Some(ref mut oracle) = oracle {
+            oracle.switchboard_feed_pubkey = Some(switchboard_feed_pubkey);
+            switchboard_feed_pubkey
+        } else {
+            panic!("oracle not initialized");
+        }
+    }
+
     pub async fn set_switchboard_price(&mut self, mint: &Pubkey, price: SwitchboardPriceArgs) {
         let oracle = self.mints.get(mint).unwrap().unwrap();
         self.process_transaction(
             &[set_switchboard_price(
                 switchboard_v2_mainnet::id(),
+                oracle.switchboard_feed_pubkey.unwrap(),
+                price.price,
+                price.expo,
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    pub async fn set_switchboard_pull_price(&mut self, mint: &Pubkey, price: SwitchboardPriceArgs) {
+        let oracle = self.mints.get(mint).unwrap().unwrap();
+        self.process_transaction(
+            &[set_switchboard_pull_price(
+                switchboard_on_demand_mainnet::id(),
                 oracle.switchboard_feed_pubkey.unwrap(),
                 price.price,
                 price.expo,
@@ -544,7 +656,7 @@ impl SolendProgramTest {
         let res = self
             .process_transaction(
                 &[
-                    ComputeBudgetInstruction::set_compute_unit_limit(70_000),
+                    ComputeBudgetInstruction::set_compute_unit_limit(80_000),
                     init_reserve(
                         solend_program::id(),
                         liquidity_amount,
@@ -827,7 +939,7 @@ impl Info<LendingMarket> {
         collateral_amount: u64,
     ) -> Result<(), BanksClientError> {
         let instructions = [
-            ComputeBudgetInstruction::set_compute_unit_limit(48_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(58_000),
             refresh_reserve(
                 solend_program::id(),
                 reserve.pubkey,
@@ -923,7 +1035,7 @@ impl Info<LendingMarket> {
     ) -> Result<(), BanksClientError> {
         test.process_transaction(
             &[
-                ComputeBudgetInstruction::set_compute_unit_limit(40_000),
+                ComputeBudgetInstruction::set_compute_unit_limit(2_000_000),
                 refresh_reserve(
                     solend_program::id(),
                     reserve.pubkey,
@@ -1044,7 +1156,7 @@ impl Info<LendingMarket> {
             .await;
         test.process_transaction(&refresh_ixs, None).await.unwrap();
 
-        let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(1_000_000)];
+        let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_limit(100_000)];
         instructions.push(borrow_obligation_liquidity(
             solend_program::id(),
             liquidity_amount,
@@ -1078,7 +1190,7 @@ impl Info<LendingMarket> {
         liquidity_amount: u64,
     ) -> Result<(), BanksClientError> {
         let instructions = [
-            ComputeBudgetInstruction::set_compute_unit_limit(27_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(35_000),
             repay_obligation_liquidity(
                 solend_program::id(),
                 liquidity_amount,
@@ -1102,7 +1214,7 @@ impl Info<LendingMarket> {
         reserve: &Info<Reserve>,
     ) -> Result<(), BanksClientError> {
         let instructions = [
-            ComputeBudgetInstruction::set_compute_unit_limit(40_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(50_000),
             refresh_reserve(
                 solend_program::id(),
                 reserve.pubkey,
@@ -1138,7 +1250,7 @@ impl Info<LendingMarket> {
 
         test.process_transaction(
             &[
-                ComputeBudgetInstruction::set_compute_unit_limit(100_000),
+                ComputeBudgetInstruction::set_compute_unit_limit(110_000),
                 liquidate_obligation_and_redeem_reserve_collateral(
                     solend_program::id(),
                     liquidity_amount,
@@ -1215,7 +1327,7 @@ impl Info<LendingMarket> {
 
         test.process_transaction(
             &[
-                ComputeBudgetInstruction::set_compute_unit_limit(100_000),
+                ComputeBudgetInstruction::set_compute_unit_limit(110_000),
                 withdraw_obligation_collateral_and_redeem_reserve_collateral(
                     solend_program::id(),
                     collateral_amount,
@@ -1758,10 +1870,7 @@ pub async fn custom_scenario(
             .or_insert(arg.liquidity_amount);
     }
 
-    let mints_and_liquidity_amounts = mints_and_liquidity_amounts
-        .into_iter()
-        .map(|(mint, liquidity_amount)| (mint, liquidity_amount))
-        .collect::<Vec<_>>();
+    let mints_and_liquidity_amounts = mints_and_liquidity_amounts.into_iter().collect::<Vec<_>>();
 
     let lending_market_owner =
         User::new_with_balances(&mut test, &mints_and_liquidity_amounts).await;
