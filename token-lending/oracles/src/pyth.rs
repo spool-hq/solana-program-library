@@ -119,7 +119,7 @@ pub fn get_pyth_price(
         LendingError::InvalidOracleConfig
     })?;
     let pyth_price = price_account
-        .get_price_no_older_than(clock, STALE_AFTER_SLOTS_ELAPSED)
+        .get_price_no_older_than(clock, u64::MAX)
         .ok_or_else(|| {
             msg!("Pyth oracle price is too stale!");
             LendingError::InvalidOracleConfig
